@@ -49,6 +49,34 @@ def read_fasta(path: str) -> Dict[str, str]:
     return {name: "".join(chunks) for name, chunks in sequences.items()}
 
 
+def build_contig_lookup(genome: Dict[str, str]) -> Dict[str, str]:
+    """Build a lookup that maps common chromosome aliases to FASTA contig names."""
+    lookup: Dict[str, str] = {}
+
+    for contig in genome:
+        candidates = {contig}
+
+        if contig.startswith("chr"):
+            candidates.add(contig[3:])
+        else:
+            candidates.add(f"chr{contig}")
+
+        if contig in {"MT", "chrMT"}:
+            candidates.update({"M", "chrM"})
+        if contig in {"M", "chrM"}:
+            candidates.update({"MT", "chrMT"})
+
+        for candidate in candidates:
+            if candidate in lookup and lookup[candidate] != contig:
+                raise ValueError(
+                    "Ambiguous contig alias mapping for "
+                    f"'{candidate}' ({lookup[candidate]} vs {contig})"
+                )
+            lookup[candidate] = contig
+
+    return lookup
+
+
 def parse_vcf_records(path: str) -> Iterator[Tuple[str, int, str, str]]:
     """Yield (chrom, pos, ref, alt) for each ALT allele in the VCF."""
     with open(path, "r", encoding="utf-8") as handle:
@@ -98,15 +126,17 @@ def write_variant_windows(
     window_size: int,
 ) -> int:
     genome = read_fasta(genome_fasta_path)
+    contig_lookup = build_contig_lookup(genome)
     records_written = 0
 
     with open(output_fasta_path, "w", encoding="utf-8") as out_handle:
         for chrom, pos, ref, alt in parse_vcf_records(vcf_path):
-            if chrom not in genome:
+            resolved_chrom = contig_lookup.get(chrom)
+            if resolved_chrom is None:
                 raise ValueError(f"Chromosome '{chrom}' not found in FASTA")
 
-            start, end, seq = extract_window(genome[chrom], pos, window_size)
-            header = f"{chrom}:{pos}:{ref}>{alt}|window={start}-{end}|len={len(seq)}"
+            start, end, seq = extract_window(genome[resolved_chrom], pos, window_size)
+            header = f"{resolved_chrom}:{pos}:{ref}>{alt}|window={start}-{end}|len={len(seq)}"
             out_handle.write(f">{header}\n{seq}\n")
             records_written += 1
 
