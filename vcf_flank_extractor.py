@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Dict, Iterator, Tuple
 
 
@@ -77,10 +78,10 @@ def build_contig_lookup(genome: Dict[str, str]) -> Dict[str, str]:
     return lookup
 
 
-def parse_vcf_records(path: str) -> Iterator[Tuple[str, int, str, str]]:
-    """Yield (chrom, pos, ref, alt) for each ALT allele in the VCF."""
+def parse_vcf_records(path: str) -> Iterator[Tuple[int, str, int, str, str]]:
+    """Yield (line_no, chrom, pos, ref, alt) for each ALT allele in the VCF."""
     with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
+        for line_no, line in enumerate(handle, start=1):
             if not line or line.startswith("#"):
                 continue
 
@@ -96,7 +97,21 @@ def parse_vcf_records(path: str) -> Iterator[Tuple[str, int, str, str]]:
             for alt in alts:
                 if alt == ".":
                     continue
-                yield chrom, pos, ref, alt
+                yield line_no, chrom, pos, ref, alt
+
+
+def is_valid_allele(allele: str) -> bool:
+    """Return True when the allele uses standard DNA/IUPAC N bases."""
+    return bool(allele) and set(allele.upper()) <= {"A", "C", "G", "T", "N"}
+
+
+def reference_matches(sequence: str, pos_1_based: int, ref: str) -> bool:
+    """Check whether REF matches the reference genome at POS."""
+    start = pos_1_based - 1
+    end = start + len(ref)
+    if start < 0 or end > len(sequence):
+        return False
+    return sequence[start:end].upper() == ref.upper()
 
 
 def extract_window(sequence: str, pos_1_based: int, window_size: int) -> Tuple[int, int, str]:
@@ -129,16 +144,47 @@ def write_variant_windows(
     contig_lookup = build_contig_lookup(genome)
     records_written = 0
 
+    skipped_records = 0
+
     with open(output_fasta_path, "w", encoding="utf-8") as out_handle:
-        for chrom, pos, ref, alt in parse_vcf_records(vcf_path):
+        for line_no, chrom, pos, ref, alt in parse_vcf_records(vcf_path):
             resolved_chrom = contig_lookup.get(chrom)
             if resolved_chrom is None:
                 raise ValueError(f"Chromosome '{chrom}' not found in FASTA")
 
+            if not is_valid_allele(ref) or not is_valid_allele(alt):
+                print(
+                    f"Skipping VCF line {line_no}: invalid REF/ALT bases ({ref}>{alt})",
+                    file=sys.stderr,
+                )
+                skipped_records += 1
+                continue
+
+            if not reference_matches(genome[resolved_chrom], pos, ref):
+                print(
+                    f"Skipping VCF line {line_no}: REF '{ref}' does not match "
+                    f"{resolved_chrom}:{pos} in FASTA",
+                    file=sys.stderr,
+                )
+                skipped_records += 1
+                continue
+
             start, end, seq = extract_window(genome[resolved_chrom], pos, window_size)
+            if seq and set(seq) == {"N"}:
+                print(
+                    f"Skipping VCF line {line_no}: extracted window is all Ns "
+                    f"({resolved_chrom}:{start}-{end})",
+                    file=sys.stderr,
+                )
+                skipped_records += 1
+                continue
+
             header = f"{resolved_chrom}:{pos}:{ref}>{alt}|window={start}-{end}|len={len(seq)}"
             out_handle.write(f">{header}\n{seq}\n")
             records_written += 1
+
+    if skipped_records:
+        print(f"Skipped {skipped_records} problematic VCF record(s)", file=sys.stderr)
 
     return records_written
 
